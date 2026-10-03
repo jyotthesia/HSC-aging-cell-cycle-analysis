@@ -1,0 +1,604 @@
+---
+title: "Re-analysis of Age-associated Cell-cycle Changes in Hematopoietic Stem and Progenitor Cells"
+author: "Jyot Thesia"
+date: "15 September 2026"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: readable
+    code_folding: hide
+subtitle: "Single-cell RNA-seq dataset from Kowalczyk et al. (2015), GSE59114"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, warning = FALSE, message = FALSE,
+  fig.width = 7, fig.height = 5, dpi = 150
+)
+```
+
+# What this notebook does
+
+Starting from the raw single-cell expression matrix (GEO accession
+**GSE59114**), this notebook re-analyzes the dataset following the core analytical logic of Kowalczyk et al.:
+
+1. **Import** the raw single-cell log2(TPM+1) expression matrix and parse
+   cell metadata (age, cell type, replicate cohort) from the sample names.
+2. **Calculate** G1/S and G2/M cell-cycle signature scores for every single
+   cell directly from the expression matrix (no pre-computed scores are
+   used).
+3. **Classify** each cell into a cell-cycle state (G0/non-cycling, G1/S
+   phase, G2/M phase) using unsupervised clustering on those two scores.
+4. **Quantify and test** how the proportion of cells in each phase changes
+   with age, separately for LT-HSC (a), ST-HSC (b), and MPP (c).
+5. **Test** whether specific cyclins/CDKs are differentially expressed
+   between old and young LT-HSCs, focusing specifically on the *G0
+   (non-cycling)* subset (d) - i.e. whether "quiescent" old and young cells
+   are really transcriptionally equivalent, or whether quiescence itself
+   looks different with age.
+
+---
+
+# Data import
+
+## Technical note
+
+The source file is a single large Excel sheet: **8,422 gene rows x 1,434
+samples**. Most columns are individual single cells (log2(TPM+1)
+expression); the last 6 columns are bulk population RNA-seq controls (one
+per cell type x age) and are excluded from all single-cell analyses below.
+Gene symbols in the sheet carry a literal leading/trailing apostrophe
+(Excel's "store as text" convention, e.g. `'Actb'`) which we strip. A small
+number of gene symbols (~65 of 8,422) appear more than once in the sheet; we average these
+duplicate rows so each gene symbol is represented exactly once, keeping all
+downstream indexing and joins well-defined.
+
+```{r imports}
+library(openxlsx)
+library(ggplot2)
+
+# Accessing the dataset
+data_path <- "GSE59114_C57BL6_GEO_all.xlsx"
+```
+
+```{r load-data, cache=TRUE}
+raw <- read.xlsx(data_path, sheet = 1)
+
+# First column = gene symbols (strip literal quote characters)
+gene_symbols <- gsub("^'|'$", "", raw[[1]])
+
+# Remaining columns = expression values -> numeric matrix
+expr_raw <- as.matrix(raw[, -1])
+storage.mode(expr_raw) <- "numeric"
+
+# Collapse duplicate gene symbols by averaging their rows
+gene_counts <- table(gene_symbols)
+expr_sum    <- rowsum(expr_raw, group = gene_symbols)
+expr_mat    <- expr_sum / as.vector(gene_counts[rownames(expr_sum)])
+
+n_dup <- sum(gene_counts > 1)
+cat("Duplicate gene symbols collapsed by averaging:", n_dup, "\n")
+cat("Loaded expression matrix:", nrow(expr_mat), "unique genes x",
+    ncol(expr_mat), "samples\n")
+```
+
+## Identify single cells vs. bulk population controls
+
+Bulk population samples were re-labelled by Excel with a leading apostrophe
+(e.g. `'Young.LT-HSC'`) when the sheet was written; genuine single-cell
+columns were not. We use that as a simple, robust filter.
+
+```{r identify-cells}
+is_population <- grepl("^'", colnames(expr_mat))
+sc_cols <- colnames(expr_mat)[!is_population]
+pop_cols <- colnames(expr_mat)[is_population]
+
+cat("Single cells:", length(sc_cols), "\n")
+cat("Bulk population controls (excluded from single-cell analysis):",
+    length(pop_cols), "->", paste(pop_cols, collapse = ", "), "\n")
+
+sc_expr <- expr_mat[, sc_cols]
+```
+
+## Parse sample metadata
+
+Single-cell sample names encode cell type, age, and (for two age/cell-type
+combinations) whether the cell came from an independently-collected
+biological replicate cohort profiled later, e.g.:
+
+* `young_LT_HSC_2`
+* `old_ST_HSC_biol_replicate_45`
+
+```{r parse-meta}
+cell_id   <- sc_cols
+age       <- ifelse(startsWith(cell_id, "young"), "young", "old")
+replicate <- grepl("biol_replicate", cell_id)
+
+celltype <- ifelse(grepl("LT_HSC", cell_id), "LT_HSC",
+             ifelse(grepl("ST_HSC", cell_id), "ST_HSC",
+               ifelse(grepl("MPP", cell_id), "MPP", NA_character_)))
+
+age      <- factor(age, levels = c("young", "old"))
+celltype <- factor(celltype, levels = c("LT_HSC", "ST_HSC", "MPP"))
+
+meta <- data.frame(cell_id = cell_id, age = age, replicate = replicate,
+                    celltype = celltype, stringsAsFactors = FALSE)
+
+count_tab <- as.data.frame(table(celltype = meta$celltype, age = meta$age,
+                                  replicate = meta$replicate))
+names(count_tab)[names(count_tab) == "Freq"] <- "n"
+count_tab <- count_tab[count_tab$n > 0, ]
+
+knitr::kable(count_tab, row.names = FALSE,
+             caption = "Number of single cells per group")
+```
+
+---
+
+# Cell-cycle signature scoring
+
+## Biological rationale
+
+Kowalczyk et al. found that in every HSC/progenitor population, the
+**largest source of cell-to-cell transcriptional variability is cell
+cycle status**, not cell identity or age. Before we can ask anything about
+aging, we therefore need a way to place each individual cell somewhere on
+the cell cycle (quiescent/G0, G1/S, or G2/M), based purely on its
+transcriptome.
+
+## Technical rationale
+
+We use the classical **Whitfield et al. (2002)** periodicity gene sets
+(derived from synchronized HeLa cells), restricted to genes that peak in
+**G1/S** (DNA replication machinery: *Mcm2-6, Pcna, Rrm1/2, Cdc6, Cdc45...*)
+or **G2/M** (mitotic machinery: *Cdk1, Ccnb2, Aurka/b, Top2a, Mki67...*).
+These are mapped from human to mouse gene symbols (standard
+capitalize-first-letter convention). This is the same class of signature
+the original paper used (they additionally refined it against their own
+data; we use the published, un-refined gene sets directly for
+transparency/reproducibility).
+
+For each cell we compute a **signature score** as the simple average
+log2(TPM+1) expression across all genes in a signature that are present in
+the data set - this is a standard, robust way of summarizing a co-regulated
+gene module for a single cell.
+
+```{r cc-genesets}
+g1s_human <- c("MCM5","PCNA","TYMS","FEN1","MCM2","MCM4","RRM1","UNG","GINS2","MCM6",
+  "CDCA7","DTL","PRIM1","UHRF1","HELLS","RFC2","RPA2","NASP","RAD51AP1","GMNN",
+  "WDR76","SLBP","CCNE2","UBR7","POLD3","MSH2","ATAD2","RAD51","RRM2","CDC45",
+  "CDC6","EXO1","TIPIN","DSCC1","BLM","CASP8AP2","USP1","CLSPN","POLA1","CHAF1B",
+  "BRIP1","E2F8")
+
+g2m_human <- c("HMGB2","CDK1","NUSAP1","UBE2C","BIRC5","TPX2","TOP2A","NDC80","CKS2","NUF2",
+  "CKS1B","MKI67","TMPO","CENPF","TACC3","FAM64A","SMC4","CCNB2","CKAP2L","CKAP2",
+  "AURKB","BUB1","KIF11","ANP32E","TUBB4B","GTSE1","KIF20B","HJURP","CDCA3","HN1",
+  "CDC20","TTK","CDC25C","KIF2C","RANGAP1","NCAPD2","DLGAP5","CDCA2","CDCA8","ECT2",
+  "KIF23","HMMR","AURKA","PSRC1","ANLN","LBR","CKAP5","CENPE","CTCF","NEK2",
+  "G2E3","GAS2L3","CBX5","CENPA")
+
+to_mouse_symbol <- function(x) paste0(toupper(substr(x, 1, 1)),
+                                       tolower(substr(x, 2, nchar(x))))
+
+g1s_mouse <- unique(to_mouse_symbol(g1s_human))
+g2m_mouse <- unique(to_mouse_symbol(g2m_human))
+
+g1s_present <- intersect(g1s_mouse, rownames(sc_expr))
+g2m_present <- intersect(g2m_mouse, rownames(sc_expr))
+
+cat("G1/S signature genes found in data:", length(g1s_present), "/", length(g1s_mouse), "\n")
+cat("G2/M signature genes found in data:", length(g2m_present), "/", length(g2m_mouse), "\n")
+```
+
+```{r cc-scores}
+meta$G1S_score <- colMeans(sc_expr[g1s_present, meta$cell_id, drop = FALSE])
+meta$G2M_score <- colMeans(sc_expr[g2m_present, meta$cell_id, drop = FALSE])
+
+knitr::kable(head(meta), digits = 2,
+             caption = "First few cells with computed signature scores")
+```
+
+## Sanity check: does the trajectory look right?
+
+Before trusting these scores for anything downstream, we check that they
+reproduce the qualitative pattern from the paper's Figure 2F: cells should
+trace an **arc** from quiescence (low/low) through G1/S (rising x) into
+G2/M (rising y, falling x on the way back), rather than a random cloud.
+
+```{r fig2f-sanity, fig.width=6, fig.height=5.5}
+ggplot(meta, aes(x = G1S_score, y = G2M_score)) +
+  geom_point(alpha = 0.35, size = 1) +
+  labs(title = "Sanity check: G1/S vs. G2/M signature scores, all single cells",
+       subtitle = "Expected: an arc-shaped trajectory (G0 -> G1/S -> S -> G2/M -> G0), as in Fig. 2F",
+       x = "G1/S score", y = "G2/M score") +
+  theme_classic(base_size = 13)
+```
+
+The arc is clearly visible: a dense low/low cluster (quiescent cells)
+tailing off through rising G1/S values, curving up into high G2/M values,
+and back down - confirming the scores behave as expected before we use them
+for classification.
+
+---
+
+# Classifying cells into cell-cycle phases
+
+## Biological rationale
+
+The paper defines three functional clusters from this 2D score space:
+cells expressing neither program (**quiescent/G0**), cells dominated by the
+**G1/S** program (actively replicating DNA), and cells dominated by the
+**G2/M** program (preparing for/undergoing mitosis). This lets us go from a
+continuous score to a discrete, interpretable cell state per cell.
+
+## Technical rationale
+
+We use **k-means clustering (k = 3)** on the two scores, pooling *all*
+single cells from all cell types and ages together (so that the phase
+definitions are learned independently of age - we don't want to bias the
+clusters toward finding an age effect). Clusters are then labelled
+post-hoc, using their centroid coordinates:
+
+* the cluster with the lowest total signal (G1S + G2M) -> **G0 (non-cycling)**
+* of the remaining two, the one relatively higher in G2M -> **G2/M phase**
+* the other -> **G1/S phase**
+
+```{r kmeans-classify}
+set.seed(1)
+km <- kmeans(meta[, c("G1S_score", "G2M_score")], centers = 3, nstart = 25)
+meta$cluster <- factor(km$cluster)
+
+centers <- as.data.frame(km$centers)
+centers$cluster <- rownames(km$centers)
+centers$total   <- centers$G1S_score + centers$G2M_score
+centers$diff    <- centers$G2M_score - centers$G1S_score
+
+g0_id  <- centers$cluster[which.min(centers$total)]
+rest   <- centers[centers$cluster != g0_id, ]
+g2m_id <- rest$cluster[which.max(rest$diff)]
+g1s_id <- rest$cluster[which.min(rest$diff)]
+
+phase_map <- setNames(c("G0 (non-cycling)", "G1/S phase", "G2/M phase"),
+                       c(g0_id, g1s_id, g2m_id))
+
+meta$phase <- factor(phase_map[as.character(meta$cluster)],
+                      levels = c("G0 (non-cycling)", "G1/S phase", "G2/M phase"))
+
+knitr::kable(centers, digits = 2, caption = "k-means cluster centres (all cells pooled)")
+knitr::kable(as.data.frame(table(meta$phase)), col.names = c("Phase", "N cells"),
+             caption = "Cells assigned to each phase, all cell types & ages pooled")
+```
+
+```{r plot-classified, fig.width=6.5, fig.height=5.5}
+ggplot(meta, aes(x = G1S_score, y = G2M_score, color = phase)) +
+  geom_point(alpha = 0.5, size = 1) +
+  scale_color_manual(values = c("G0 (non-cycling)" = "grey60",
+                                 "G1/S phase" = "#3B7DD8",
+                                 "G2/M phase" = "#D8423B")) +
+  labs(title = "Cell-cycle phase classification (k-means, k = 3)",
+       x = "G1/S score", y = "G2/M score", color = "Phase") +
+  theme_classic(base_size = 13)
+```
+
+---
+
+# Cell-cycle phase proportions: young vs. old, by cell type
+
+## Biological rationale
+
+If HSC aging is at least partly a **compositional** phenomenon (a shift in
+the proportion of cells occupying particular states, rather than every
+cell changing uniformly), we expect to see age-dependent shifts in the
+*fraction* of cells in each cell-cycle phase - and, per the paper, we
+expect this to be specific to LT-HSCs, since they are the population whose
+self-renewal/differentiation balance is thought to shift with age. ST-HSCs
+should show at most a weak version of the same trend, and MPPs - which are
+already highly proliferative progenitors - should be largely unaffected,
+since they're several steps removed from the self-renewal decisions LT-HSCs
+face.
+
+## Technical rationale
+
+For each cell type we build a 2x3 contingency table (age x phase) using
+only the **main experimental cohort** (excluding the independently-profiled
+"biological replicate" cells, which we hold out as an independent replicate
+check). We test each phase against the other two combined using **Fisher's
+exact test**, which avoids relying on large-sample approximations.
+
+**Note:** the statistical test is performed at the single-cell level, so the
+cells should not be interpreted as independent biological replicates. The
+available biological-replicate cohort is therefore kept separate as a
+replicate check, and the p-values are interpreted as evidence of differences
+in the observed cell-level distributions rather than as formal
+mouse-level inference.
+
+```{r analysis-function}
+analyse_celltype <- function(ct, label) {
+
+  sub  <- meta[meta$celltype == ct, ]
+  main <- sub[!sub$replicate, ]
+
+  prop_tab <- as.data.frame(table(age = main$age, phase = main$phase))
+  names(prop_tab)[names(prop_tab) == "Freq"] <- "n"
+  prop_tab <- prop_tab[prop_tab$n > 0, ]
+  prop_tab$pct <- ave(prop_tab$n, prop_tab$age, FUN = function(x) 100 * x / sum(x))
+
+  fisher_res <- do.call(rbind, lapply(levels(main$phase), function(ph) {
+    tab <- table(main$age, main$phase == ph)
+    ft  <- fisher.test(tab)
+    data.frame(
+      phase     = ph,
+      pct_young = 100 * tab["young", "TRUE"] / sum(tab["young", ]),
+      pct_old   = 100 * tab["old",   "TRUE"] / sum(tab["old", ]),
+      p_value   = ft$p.value,
+      stringsAsFactors = FALSE
+    )
+  }))
+
+  p <- ggplot(prop_tab, aes(x = age, y = pct, fill = phase)) +
+    geom_col(position = "stack", color = "white", linewidth = 0.3) +
+    geom_text(aes(label = paste0(round(pct, 1), "%")),
+              position = position_stack(vjust = 0.5), size = 3.5, color = "white") +
+    scale_fill_manual(values = c("G0 (non-cycling)" = "grey55",
+                                  "G1/S phase" = "#3B7DD8",
+                                  "G2/M phase" = "#D8423B")) +
+    labs(title = paste0(label, ": cell-cycle phase distribution"),
+         x = NULL, y = "% of cells", fill = "Phase") +
+    theme_classic(base_size = 13)
+
+  replicate_check <- NULL
+  if (any(sub$replicate)) {
+    rep_sub <- sub[sub$replicate, ]
+    rc <- as.data.frame(table(phase = rep_sub$phase))
+    names(rc)[names(rc) == "Freq"] <- "n"
+    rc$pct <- 100 * rc$n / sum(rc$n)
+    replicate_check <- rc
+  }
+
+  list(proportions = prop_tab, fisher = fisher_res, plot = p,
+       replicate_check = replicate_check)
+}
+```
+
+## (a) LT-HSC
+
+```{r lt-hsc}
+res_LT <- analyse_celltype("LT_HSC", "LT-HSC")
+res_LT$plot
+knitr::kable(res_LT$fisher, digits = c(0, 1, 1, 4), row.names = FALSE,
+             caption = "LT-HSC: Fisher's exact test, young vs. old (each phase vs. rest)")
+```
+
+```{r lt-hsc-replicate}
+knitr::kable(res_LT$replicate_check, digits = 1, row.names = FALSE,
+             caption = "LT-HSC, old: independent biological-replicate cohort (confirmatory)")
+```
+
+**Interpretation.** LT-HSCs show a clear, statistically significant drop in
+the fraction of cells in **G1/S phase** with age, mirrored by an increase
+in the quiescent (G0) fraction, while G2/M is essentially unchanged. This
+is the paper's headline single-cell finding: old LT-HSCs are depleted
+specifically in G1/S, consistent with these cells **transiting G1 faster**
+once they do enter cycle (rather than simply being "more quiescent" in a
+generic sense). The independent replicate cohort shows the same pattern,
+arguing against a batch artifact.
+
+## (b) ST-HSC
+
+```{r st-hsc}
+res_ST <- analyse_celltype("ST_HSC", "ST-HSC")
+res_ST$plot
+knitr::kable(res_ST$fisher, digits = c(0, 1, 1, 4), row.names = FALSE,
+             caption = "ST-HSC: Fisher's exact test, young vs. old (each phase vs. rest)")
+```
+
+```{r st-hsc-replicate}
+knitr::kable(res_ST$replicate_check, digits = 1, row.names = FALSE,
+             caption = "ST-HSC, old: independent biological-replicate cohort (confirmatory)")
+```
+
+**Interpretation.** ST-HSCs show the same general direction of change
+(fewer cells in G1/S and more in G0 with age), but the effect is smaller and
+not statistically significant in this analysis. This suggests that the
+age-associated pattern seen in LT-HSCs is less pronounced in ST-HSCs.
+
+## (c) MPP
+
+```{r mpp}
+res_MPP <- analyse_celltype("MPP", "MPP")
+res_MPP$plot
+knitr::kable(res_MPP$fisher, digits = c(0, 1, 1, 4), row.names = FALSE,
+             caption = "MPP: Fisher's exact test, young vs. old (each phase vs. rest)")
+```
+
+**Interpretation.** MPPs show no statistically significant age-associated
+change in cell-cycle phase distribution in this analysis. They also have a
+larger fraction of actively cycling cells than LT-/ST-HSCs. Overall, this
+suggests that the age-associated change observed in LT-HSCs is not equally
+pronounced across all of the cell populations examined.
+
+## Combined summary
+
+```{r combined-summary, fig.width=10, fig.height=5}
+main_all <- meta[!meta$replicate, ]
+
+prop_all <- as.data.frame(table(celltype = main_all$celltype,
+                                 age = main_all$age,
+                                 phase = main_all$phase))
+names(prop_all)[names(prop_all) == "Freq"] <- "n"
+prop_all <- prop_all[prop_all$n > 0, ]
+prop_all$pct <- ave(prop_all$n, interaction(prop_all$celltype, prop_all$age, drop = TRUE),
+                     FUN = function(x) 100 * x / sum(x))
+
+ggplot(prop_all, aes(x = age, y = pct, fill = phase)) +
+  geom_col(position = "stack", color = "white", linewidth = 0.3) +
+  facet_wrap(~ celltype, nrow = 1) +
+  scale_fill_manual(values = c("G0 (non-cycling)" = "grey55",
+                                "G1/S phase" = "#3B7DD8",
+                                "G2/M phase" = "#D8423B")) +
+  labs(title = "Cell-cycle phase distribution: young vs. old",
+       subtitle = "LT-HSC, ST-HSC, MPP (C57BL/6, GSE59114)",
+       x = NULL, y = "% of cells", fill = "Phase") +
+  theme_classic(base_size = 13) +
+  theme(strip.background = element_rect(fill = "grey90", color = NA))
+```
+
+---
+
+# Cell-cycle regulator expression in G0-defined LT-HSCs
+
+## Biological rationale
+
+Sections (a-c) show that old LT-HSCs are depleted in cells actively
+transiting G1/S. A separate, complementary question is: **among cells that
+are already quiescent (G0) in both age groups, is their cell-cycle
+regulatory machinery expressed at the same level, or has quiescence itself
+changed with age?** If old "G0" LT-HSCs already show altered
+cyclin/CDK expression before ever entering cycle, that would suggest an
+intrinsic, pre-set bias in cell-cycle regulators - potentially explaining
+*why* they transit G1 faster once they re-enter the cycle, and linking to
+the paper's model of a self-renewal-biased expression program in old
+LT-HSCs.
+
+## Technical rationale
+
+* We extract cell-cycle regulator genes matching cyclins (`Ccn*`),
+  cyclin-dependent kinases (`Cdk*`), or CDK inhibitors (`Cdkn*`) directly
+  from the full expression matrix.
+* We restrict to **LT-HSC cells classified as G0 (non-cycling)** in the
+  main cohort (from the classification above). The same computational gate
+  is used for both ages, so any difference reflects expression differences
+  *within* the defined G0 group rather than differences in which cells are
+  called G0.
+* For each gene we compare old vs. young with a **Wilcoxon rank-sum test**
+  and a Welch's t-test for reference. Benjamini-Hochberg correction is used
+  to account for testing multiple genes.
+
+```{r cyclin-cdk-extract}
+is_cyclin_cdk <- grepl(
+  "^(Ccn[A-Za-z0-9]*|Cdk[A-Za-z0-9]*|Cdkn[A-Za-z0-9]*)$",
+  rownames(sc_expr)
+)
+cc_genes <- rownames(sc_expr)[is_cyclin_cdk]
+cat("Cyclin/CDK genes found in data set:", length(cc_genes), "\n")
+cat(paste(sort(cc_genes), collapse = ", "), "\n")
+
+cc_expr <- as.data.frame(t(sc_expr[cc_genes, , drop = FALSE]))
+cc_expr$cell_id <- rownames(cc_expr)
+```
+
+```{r cyclin-cdk-g0-subset}
+lt_g0_main <- meta[meta$celltype == "LT_HSC" & !meta$replicate &
+                      meta$phase == "G0 (non-cycling)", ]
+
+cc_cols <- setdiff(names(cc_expr), "cell_id")
+lt_g0_main <- cbind(lt_g0_main,
+                     cc_expr[match(lt_g0_main$cell_id, cc_expr$cell_id), cc_cols])
+
+age_counts <- as.data.frame(table(age = lt_g0_main$age))
+names(age_counts)[names(age_counts) == "Freq"] <- "n"
+
+knitr::kable(age_counts, row.names = FALSE,
+             caption = "Number of G0 (non-cycling) LT-HSC cells per age group, used for testing")
+```
+
+```{r cyclin-cdk-test}
+test_one_gene <- function(g, df) {
+  x_young <- df[[g]][df$age == "young"]
+  x_old   <- df[[g]][df$age == "old"]
+  wt <- tryCatch(wilcox.test(x_old, x_young)$p.value, error = function(e) NA)
+  tt <- tryCatch(t.test(x_old, x_young)$p.value, error = function(e) NA)
+  data.frame(
+    gene       = g,
+    mean_young = mean(x_young),
+    mean_old   = mean(x_old),
+    log2FC_old_vs_young = mean(x_old) - mean(x_young),  # already log2(TPM+1) scale
+    p_wilcox   = wt,
+    p_ttest    = tt,
+    stringsAsFactors = FALSE
+  )
+}
+
+res_tab <- do.call(rbind, lapply(cc_genes, test_one_gene, df = lt_g0_main))
+res_tab$p_wilcox_adj <- p.adjust(res_tab$p_wilcox, method = "BH")
+res_tab <- res_tab[order(res_tab$p_wilcox), ]
+res_tab <- res_tab[, c("gene", "mean_young", "mean_old", "log2FC_old_vs_young",
+                        "p_wilcox", "p_wilcox_adj", "p_ttest")]
+
+knitr::kable(res_tab, digits = 3, row.names = FALSE,
+             caption = "Cyclin/CDK genes tested in G0 LT-HSCs, old vs. young (sorted by Wilcoxon p-value)")
+```
+
+```{r cyclin-cdk-sig}
+sig <- res_tab[!is.na(res_tab$p_wilcox) & res_tab$p_wilcox < 0.05, ]
+knitr::kable(sig, digits = 3, row.names = FALSE,
+             caption = "Genes with nominal p < 0.05 (Wilcoxon, old vs. young, within G0)")
+```
+
+```{r cyclin-cdk-plot, fig.width=9, fig.height=6}
+top_genes <- head(res_tab$gene[!is.na(res_tab$p_wilcox)], 6)
+
+plot_dat <- do.call(rbind, lapply(top_genes, function(g) {
+  data.frame(age = lt_g0_main$age, gene = g, expr = lt_g0_main[[g]])
+}))
+plot_dat$gene <- factor(plot_dat$gene, levels = top_genes)
+
+ggplot(plot_dat, aes(x = age, y = expr, fill = age)) +
+  geom_violin(alpha = 0.6, scale = "width", trim = TRUE) +
+  geom_jitter(width = 0.1, size = 0.6, alpha = 0.4) +
+  facet_wrap(~ gene, scales = "free_y", nrow = 2) +
+  scale_fill_manual(values = c(young = "#3B7DD8", old = "#D8423B")) +
+  labs(title = "Cyclin/CDK expression in G0 (non-cycling) LT-HSCs",
+       subtitle = "Top genes by Wilcoxon p-value, old vs. young",
+       x = NULL, y = "log2(TPM+1)") +
+  theme_classic(base_size = 12) +
+  theme(legend.position = "none",
+        strip.background = element_rect(fill = "grey90", color = NA))
+```
+
+**Interpretation.** Within the G0-defined group, several cell-cycle
+regulators show **nominal evidence of an age-associated difference**:
+
+* **Cyclin D2 (*Ccnd2*)** is *lower* in old cells in the G0 group.
+* The CDK inhibitors **p21 (*Cdkn1a*)** and **p18 (*Cdkn2c*)** are *higher*
+  in old cells in the G0 group.
+* ***Cdk5rap1*** is *lower* in old cells in the G0 group.
+
+These differences suggest that LT-HSCs classified as G0 are not completely
+identical at the level of cell-cycle regulator expression across age groups.
+However, this analysis does not establish that the cells have different
+physiological states of quiescence or that any particular regulator causes
+the observed age-associated changes. The results are therefore best viewed
+as evidence of an age-associated transcriptional difference within the
+G0-defined population.
+
+---
+
+# Summary
+
+| Cell type | G1/S phase, young | G1/S phase, old | Significant? |
+|---|---|---|---|
+| LT-HSC | ~21% | ~7% | **Yes** (difference detected) |
+| ST-HSC | ~14% | ~10% | No (weaker difference) |
+| MPP | ~36% | ~41% | No clear difference |
+
+Taken together, the results suggest that age-associated changes in LT-HSCs
+may involve both:
+
+1. a **change in cell-cycle composition** - fewer LT-HSCs are observed in the
+   G1/S state in the old group (Sections a-c), and
+2. **differences in cell-cycle regulator expression within the G0-defined
+   population** (Section d).
+
+These findings are consistent with an age-associated change in cell-cycle
+regulation in LT-HSCs, while the present analysis does not by itself establish
+the underlying mechanism or changes in cell-cycle transit time.
+
+---
+
+# Session info
+
+```{r session-info}
+sessionInfo()
+```
